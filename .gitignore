@@ -1,0 +1,9 @@
+# Ignore all files
+*
+
+# Don't ignore common source files (un-ignore by extension)
+!*.mod
+!*.sum
+!*.go
+!.gitignore
+!README.md
