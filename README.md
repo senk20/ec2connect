@@ -1,12 +1,14 @@
-# ec2ssh
+# ec2connect
+## ec2ssh / ec2sftp
 
-`ec2ssh` is a small Go CLI for connecting to an EC2 instance over SSH with
-temporary security group access.
+`ec2ssh` and `ec2sftp` are small Go CLIs for connecting to an EC2 instance over
+SSH or SFTP with temporary security group access.
 
-Before connecting, it checks whether the instance allows SSH from your current
-public IPv4 address. If TCP port 22 is not already open for that address, the
-tool adds a temporary `/32` ingress rule, starts a local `ssh` session, and then
-removes only the rule it created when the session exits.
+Before connecting, the tool checks whether the instance allows the requested
+port from your current public IPv4 address. If TCP port 22 is not already open
+for that address, the tool adds a temporary `/32` ingress rule, starts a local
+`ssh` or `sftp` session, and then removes only the rule it created when the
+session exits.
 
 Existing security group rules are left untouched.
 
@@ -15,6 +17,7 @@ Existing security group rules are left untouched.
 ```sh
 go mod tidy
 go build -o ec2ssh .
+go build -o ec2sftp .
 ```
 
 ## Usage
@@ -34,8 +37,9 @@ Examples:
 
 ```sh
 ./ec2ssh -instance-id i-0123456789abcdef0 -user ec2-user -key ~/.ssh/my-key.pem
+./ec2sftp -instance-id i-0123456789abcdef0 -user ec2-user -key ~/.ssh/my-key.pem
 ./ec2ssh -ip 203.0.113.10 -user ec2-user -key ~/.ssh/my-key.pem
-./ec2ssh -name web-prod-01 -user ec2-user -key ~/.ssh/my-key.pem
+./ec2sftp -name web-prod-01 -user ec2-user -key ~/.ssh/my-key.pem
 ```
 
 `-ip` searches both public and private IPv4 addresses.
@@ -59,7 +63,7 @@ prints the matching instance IDs and asks you to rerun with `-instance-id`.
   address via `https://checkip.amazonaws.com` and opens `<ip>/32`.
 - `-sg-id`: security group to modify. If omitted, the first attached security
   group is used when a new rule is needed.
-- `-port`: SSH port to open and connect to. Defaults to `22`.
+- `-port`: SSH or SFTP port to open and connect to. Defaults to `22`.
 
 ## AWS Permissions
 

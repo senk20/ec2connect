@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -41,7 +42,15 @@ type addedRule struct {
 	port int32
 }
 
+type commandMode int
+
+const (
+	sshCommand commandMode = iota
+	sftpCommand
+)
+
 func main() {
+	mode := getCommandMode()
 	opts := parseFlags()
 	if err := validateOptions(opts); err != nil {
 		exitErr("%v", err)
@@ -85,7 +94,7 @@ func main() {
 		log.Printf("port %d is already open for %s", opts.port, cidr)
 	} else {
 		log.Printf("opening tcp/%d for %s on %s", opts.port, cidr, sgID)
-		if err := authorizeSSH(ctx, client, sgID, cidr, opts.port); err != nil {
+		if err := authorizeAccess(ctx, client, sgID, cidr, opts.port, mode); err != nil {
 			exitErr("open security group rule: %v", err)
 		}
 		cleanup = &addedRule{sgID: sgID, cidr: cidr, port: opts.port}
@@ -95,12 +104,12 @@ func main() {
 	go cleanupOnSignal(client, cleanup, cleanupDone)
 
 	exitCode := 0
-	if err := runSSH(target, opts); err != nil {
+	if err := runConnection(target, opts, mode); err != nil {
 		var sshExitErr *exec.ExitError
 		if errors.As(err, &sshExitErr) {
 			exitCode = sshExitErr.ExitCode()
 		} else {
-			log.Printf("ssh failed: %v", err)
+			log.Printf("connection failed: %v", err)
 			exitCode = 1
 		}
 	}
@@ -124,12 +133,12 @@ func parseFlags() options {
 	flag.StringVar(&opts.name, "name", "", "EC2 Name tag to search for; supports AWS wildcards like web-*")
 	flag.StringVar(&opts.region, "region", "", "AWS region; falls back to the profile/default region")
 	flag.StringVar(&opts.profile, "profile", "", "AWS profile; falls back to AWS_PROFILE/default provider chain")
-	flag.StringVar(&opts.user, "user", "", "SSH username, for example ec2-user or ubuntu")
-	flag.StringVar(&opts.keyPath, "key", "", "path to private key passed to ssh -i")
-	flag.StringVar(&opts.cidr, "cidr", "", "CIDR to allow for SSH; defaults to your current public IPv4 /32")
+	flag.StringVar(&opts.user, "user", "", "SSH/SFTP username, for example ec2-user or ubuntu")
+	flag.StringVar(&opts.keyPath, "key", "", "path to private key passed to ssh/sftp -i")
+	flag.StringVar(&opts.cidr, "cidr", "", "CIDR to allow for SSH/SFTP; defaults to your current public IPv4 /32")
 	flag.StringVar(&opts.sgID, "sg-id", "", "security group to modify; defaults to the first attached group needing a rule")
 	opts.port = 22
-	flag.Var((*portFlag)(&opts.port), "port", "SSH port to open and connect to")
+	flag.Var((*portFlag)(&opts.port), "port", "SSH/SFTP port to open and connect to")
 	flag.Parse()
 	if help {
 		printUsage()
@@ -156,7 +165,7 @@ func validateOptions(opts options) error {
 
 func printUsage() {
 	fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
-	fmt.Fprintln(flag.CommandLine.Output(), "Open temporary SSH access to an EC2 instance, connect with ssh, then remove the temporary rule.")
+	fmt.Fprintln(flag.CommandLine.Output(), "Open temporary SSH or SFTP access to an EC2 instance, connect with ssh/sftp, then remove the temporary rule.")
 	fmt.Fprintln(flag.CommandLine.Output(), "\nOptions:")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -h, --help")
 	fmt.Fprintln(flag.CommandLine.Output(), "    \tshow help")
@@ -442,7 +451,11 @@ func lastIP(ipNet *net.IPNet) net.IP {
 	return last
 }
 
-func authorizeSSH(ctx context.Context, client *ec2.Client, sgID string, cidr string, port int32) error {
+func authorizeAccess(ctx context.Context, client *ec2.Client, sgID string, cidr string, port int32, mode commandMode) error {
+	description := "temporary ec2ssh access"
+	if mode == sftpCommand {
+		description = "temporary ec2sftp access"
+	}
 	_, err := client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(sgID),
 		IpPermissions: []types.IpPermission{{
@@ -451,7 +464,7 @@ func authorizeSSH(ctx context.Context, client *ec2.Client, sgID string, cidr str
 			ToPort:     aws.Int32(port),
 			IpRanges: []types.IpRange{{
 				CidrIp:      aws.String(cidr),
-				Description: aws.String("temporary ec2ssh access"),
+				Description: aws.String(description),
 			}},
 		}},
 	})
@@ -459,6 +472,41 @@ func authorizeSSH(ctx context.Context, client *ec2.Client, sgID string, cidr str
 		return nil
 	}
 	return err
+}
+
+func getCommandMode() commandMode {
+	name := filepath.Base(os.Args[0])
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	if strings.EqualFold(name, "ec2sftp") {
+		return sftpCommand
+	}
+	return sshCommand
+}
+
+func runConnection(target string, opts options, mode commandMode) error {
+	args := []string{}
+	if opts.keyPath != "" {
+		args = append(args, "-i", opts.keyPath)
+	}
+	if opts.port != 22 {
+		portArg := "-p"
+		if mode == sftpCommand {
+			portArg = "-P"
+		}
+		args = append(args, portArg, fmt.Sprintf("%d", opts.port))
+	}
+	args = append(args, fmt.Sprintf("%s@%s", opts.user, target))
+
+	program := "ssh"
+	if mode == sftpCommand {
+		program = "sftp"
+	}
+
+	cmd := exec.Command(program, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func cleanupOnSignal(client *ec2.Client, cleanup *addedRule, cleanupDone <-chan struct{}) {
