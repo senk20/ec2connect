@@ -47,6 +47,7 @@ type commandMode int
 const (
 	sshCommand commandMode = iota
 	sftpCommand
+	scpCommand
 )
 
 func main() {
@@ -134,11 +135,11 @@ func parseFlags() options {
 	flag.StringVar(&opts.region, "region", "", "AWS region; falls back to the profile/default region")
 	flag.StringVar(&opts.profile, "profile", "", "AWS profile; falls back to AWS_PROFILE/default provider chain")
 	flag.StringVar(&opts.user, "user", "", "SSH/SFTP username, for example ec2-user or ubuntu")
-	flag.StringVar(&opts.keyPath, "key", "", "path to private key passed to ssh/sftp -i")
-	flag.StringVar(&opts.cidr, "cidr", "", "CIDR to allow for SSH/SFTP; defaults to your current public IPv4 /32")
+	flag.StringVar(&opts.keyPath, "key", "", "path to private key passed to ssh/sftp/scp -i")
+	flag.StringVar(&opts.cidr, "cidr", "", "CIDR to allow for SSH/SFTP/SCP; defaults to your current public IPv4 /32")
 	flag.StringVar(&opts.sgID, "sg-id", "", "security group to modify; defaults to the first attached group needing a rule")
 	opts.port = 22
-	flag.Var((*portFlag)(&opts.port), "port", "SSH/SFTP port to open and connect to")
+	flag.Var((*portFlag)(&opts.port), "port", "SSH/SFTP/SCP port to open and connect to")
 	flag.Parse()
 	if help {
 		printUsage()
@@ -165,7 +166,7 @@ func validateOptions(opts options) error {
 
 func printUsage() {
 	fmt.Fprintf(flag.CommandLine.Output(), "Usage: %s [options]\n\n", os.Args[0])
-	fmt.Fprintln(flag.CommandLine.Output(), "Open temporary SSH or SFTP access to an EC2 instance, connect with ssh/sftp, then remove the temporary rule.")
+	fmt.Fprintln(flag.CommandLine.Output(), "Open temporary SSH, SFTP, or SCP access to an EC2 instance, connect with ssh/sftp/scp, then remove the temporary rule.")
 	fmt.Fprintln(flag.CommandLine.Output(), "\nOptions:")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -h, --help")
 	fmt.Fprintln(flag.CommandLine.Output(), "    \tshow help")
@@ -180,15 +181,15 @@ func printUsage() {
 	fmt.Fprintln(flag.CommandLine.Output(), "  -region string")
 	fmt.Fprintln(flag.CommandLine.Output(), "    \tAWS region; falls back to the profile/default region")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -user string")
-	fmt.Fprintln(flag.CommandLine.Output(), "    \tSSH username, for example ec2-user or ubuntu")
+	fmt.Fprintln(flag.CommandLine.Output(), "    \tSSH/SFTP/SCP username, for example ec2-user or ubuntu")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -key string")
-	fmt.Fprintln(flag.CommandLine.Output(), "    \tpath to private key passed to ssh -i")
+	fmt.Fprintln(flag.CommandLine.Output(), "    \tpath to private key passed to ssh/sftp/scp -i")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -cidr string")
-	fmt.Fprintln(flag.CommandLine.Output(), "    \tCIDR to allow for SSH; defaults to your current public IPv4 /32")
+	fmt.Fprintln(flag.CommandLine.Output(), "    \tCIDR to allow for SSH/SFTP/SCP; defaults to your current public IPv4 /32")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -sg-id string")
 	fmt.Fprintln(flag.CommandLine.Output(), "    \tsecurity group to modify; defaults to the first attached group needing a rule")
 	fmt.Fprintln(flag.CommandLine.Output(), "  -port value")
-	fmt.Fprintln(flag.CommandLine.Output(), "    \tSSH port to open and connect to (default 22)")
+	fmt.Fprintln(flag.CommandLine.Output(), "    \tSSH/SFTP/SCP port to open and connect to (default 22)")
 }
 
 type portFlag int32
@@ -456,6 +457,9 @@ func authorizeAccess(ctx context.Context, client *ec2.Client, sgID string, cidr 
 	if mode == sftpCommand {
 		description = "temporary ec2sftp access"
 	}
+	if mode == scpCommand {
+		description = "temporary ec2scp access"
+	}
 	_, err := client.AuthorizeSecurityGroupIngress(ctx, &ec2.AuthorizeSecurityGroupIngressInput{
 		GroupId: aws.String(sgID),
 		IpPermissions: []types.IpPermission{{
@@ -480,6 +484,9 @@ func getCommandMode() commandMode {
 	if strings.EqualFold(name, "ec2sftp") {
 		return sftpCommand
 	}
+	if strings.EqualFold(name, "ec2scp") {
+		return scpCommand
+	}
 	return sshCommand
 }
 
@@ -490,16 +497,32 @@ func runConnection(target string, opts options, mode commandMode) error {
 	}
 	if opts.port != 22 {
 		portArg := "-p"
-		if mode == sftpCommand {
+		if mode == sftpCommand || mode == scpCommand {
 			portArg = "-P"
 		}
 		args = append(args, portArg, fmt.Sprintf("%d", opts.port))
 	}
-	args = append(args, fmt.Sprintf("%s@%s", opts.user, target))
 
 	program := "ssh"
 	if mode == sftpCommand {
 		program = "sftp"
+	}
+	if mode == scpCommand {
+		program = "scp"
+	}
+
+	if mode == scpCommand {
+		scpArgs := flag.Args()
+		if len(scpArgs) < 2 {
+			return fmt.Errorf("scp requires source and destination arguments")
+		}
+		if !hasRemoteSpec(scpArgs[0]) && !hasRemoteSpec(scpArgs[len(scpArgs)-1]) {
+			scpArgs[len(scpArgs)-1] = fmt.Sprintf("%s@%s:%s", opts.user, target, scpArgs[len(scpArgs)-1])
+		}
+		args = append(args, scpArgs...)
+	} else {
+		args = append(args, fmt.Sprintf("%s@%s", opts.user, target))
+		args = append(args, flag.Args()...)
 	}
 
 	cmd := exec.Command(program, args...)
@@ -507,6 +530,10 @@ func runConnection(target string, opts options, mode commandMode) error {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func hasRemoteSpec(arg string) bool {
+	return strings.Contains(arg, ":")
 }
 
 func cleanupOnSignal(client *ec2.Client, cleanup *addedRule, cleanupDone <-chan struct{}) {
